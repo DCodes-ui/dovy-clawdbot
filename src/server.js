@@ -43,6 +43,9 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// Public verification token used by Meta when registering the WhatsApp webhook.
+const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN?.trim();
+
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
@@ -352,6 +355,37 @@ app.get("/healthz", async (_req, res) => {
       lastDoctorAt,
     },
   });
+});
+
+app.get("/whatsapp/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && WHATSAPP_VERIFY_TOKEN && token === WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).type("text/plain").send(String(challenge ?? ""));
+  }
+
+  console.warn("[whatsapp] webhook verification failed");
+  return res.sendStatus(403);
+});
+
+app.post("/whatsapp/webhook", (req, res) => {
+  const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+
+  for (const entry of entries) {
+    const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+    for (const change of changes) {
+      const messages = Array.isArray(change?.value?.messages) ? change.value.messages : [];
+      for (const message of messages) {
+        console.log(
+          `[whatsapp] incoming message id=${message.id ?? "(unknown)"} from=${message.from ?? "(unknown)"} type=${message.type ?? "unknown"}`,
+        );
+      }
+    }
+  }
+
+  return res.sendStatus(200);
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
