@@ -46,6 +46,9 @@ const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 // Optional Telegram webhook secret. If set, Telegram must send it in
 // the X-Telegram-Bot-Api-Secret-Token header.
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
+const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
+const GROQ_MODEL = process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -362,6 +365,111 @@ app.get("/telegram/webhook", (_req, res) => {
   res.json({ ok: true, webhook: "telegram" });
 });
 
+async function sendTelegramMessage(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error("TELEGRAM_BOT_TOKEN is not set");
+  }
+  if (!chatId) {
+    throw new Error("Telegram chat id is missing");
+  }
+
+  const chunks = [];
+  for (let i = 0; i < text.length; i += 3900) {
+    chunks.push(text.slice(i, i + 3900));
+  }
+
+  for (const chunk of chunks.length ? chunks : [""]) {
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: chunk,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Telegram sendMessage failed: ${response.status} ${body}`);
+    }
+
+    console.log(`[telegram] sent message chat=${chatId} chars=${chunk.length}`);
+  }
+}
+
+async function callGroq(prompt) {
+  if (!GROQ_API_KEY) {
+    return "Groq ist noch nicht konfiguriert. Bitte setze GROQ_API_KEY in Railway und redeploye den Service.";
+  }
+
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Du bist ein hilfreicher Aufgaben-Assistent. Antworte kurz, konkret und auf Deutsch, sofern der Nutzer nichts anderes verlangt.",
+        },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.3,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Groq request failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  return data?.choices?.[0]?.message?.content?.trim() || "Ich habe keine Antwort von Groq erhalten.";
+}
+
+function saveTelegramConversation(record) {
+  try {
+    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+    fs.appendFileSync(
+      path.join(WORKSPACE_DIR, "telegram-conversations.jsonl"),
+      `${JSON.stringify({ ...record, at: new Date().toISOString() })}\n`,
+    );
+  } catch (err) {
+    console.warn(`[telegram] failed to save conversation: ${String(err)}`);
+  }
+}
+
+async function handleTelegramMessage({ chatId, text, updateId }) {
+  if (!chatId) return;
+
+  if (!text.trim()) {
+    try {
+      await sendTelegramMessage(chatId, "Bitte sende mir eine Textnachricht.");
+    } catch (err) {
+      console.error(`[telegram] failed to send non-text notice: ${String(err)}`);
+    }
+    return;
+  }
+
+  try {
+    await sendTelegramMessage(chatId, "Ich bearbeite deine Anfrage...");
+    const answer = await callGroq(text);
+    saveTelegramConversation({ updateId, chatId, userText: text, assistantText: answer, model: GROQ_MODEL });
+    await sendTelegramMessage(chatId, answer);
+  } catch (err) {
+    console.error(`[telegram] failed to handle message: ${String(err)}`);
+    try {
+      await sendTelegramMessage(chatId, "Beim Bearbeiten ist ein Fehler aufgetreten. Bitte prüfe die Railway Logs.");
+    } catch (sendErr) {
+      console.error(`[telegram] failed to send error message: ${String(sendErr)}`);
+    }
+  }
+}
+
 app.post("/telegram/webhook", (req, res) => {
   if (
     TELEGRAM_WEBHOOK_SECRET &&
@@ -380,7 +488,13 @@ app.post("/telegram/webhook", (req, res) => {
     `[telegram] incoming update id=${update.update_id ?? "(unknown)"} chat=${chat?.id ?? "(unknown)"} type=${chat?.type ?? "unknown"} text=${text ? JSON.stringify(text.slice(0, 120)) : "(non-text)"}`,
   );
 
-  return res.sendStatus(200);
+  res.sendStatus(200);
+
+  void handleTelegramMessage({
+    chatId: chat?.id,
+    text,
+    updateId: update.update_id,
+  });
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
