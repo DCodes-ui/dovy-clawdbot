@@ -716,6 +716,7 @@ function formatHelpMessage() {
   return [
     "Verfügbare Befehle:",
     "/help - Hilfe anzeigen",
+    "/gc - Google-Kalender-Menü öffnen",
     "/tasks - letzte Aufgaben anzeigen",
     "/last - letztes Ergebnis anzeigen",
     "/model - aktuelles Modell anzeigen",
@@ -731,7 +732,99 @@ function formatHelpMessage() {
   ].join("\n");
 }
 
-async function sendTelegramMessage(chatId, text) {
+async function answerTelegramCallback(callbackQueryId, text = "") {
+  if (!TELEGRAM_BOT_TOKEN || !callbackQueryId) return;
+
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Telegram answerCallbackQuery failed: ${response.status} ${body}`);
+  }
+}
+
+async function sendGoogleCalendarMenu(chatId) {
+  await sendTelegramMessage(chatId, "Google Kalender: Was möchtest du tun?", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "Heute", callback_data: "gc:today" },
+          { text: "Nächste Termine", callback_data: "gc:next" },
+        ],
+        [
+          { text: "Verbinden", callback_data: "gc:connect" },
+          { text: "Trennen", callback_data: "gc:disconnect" },
+        ],
+        [
+          { text: "Termin erstellen: Format anzeigen", callback_data: "gc:create_help" },
+        ],
+      ],
+    },
+  });
+}
+
+async function handleGoogleCalendarAction(chatId, action) {
+  if (action === "connect") {
+    const url = googleConnectUrl(chatId);
+    await sendTelegramMessage(
+      chatId,
+      url
+        ? `Google Kalender verbinden:\n${url}`
+        : "Google OAuth ist noch nicht konfiguriert. Bitte setze GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET und GOOGLE_REDIRECT_URI in Railway.",
+    );
+    return;
+  }
+
+  if (action === "disconnect") {
+    fs.rmSync(googleTokenPath(chatId), { force: true });
+    await sendTelegramMessage(chatId, "Google Kalender wurde getrennt.");
+    return;
+  }
+
+  if (action === "today") {
+    const events = await listCalendarEvents(chatId, 10, 24);
+    await sendTelegramMessage(
+      chatId,
+      events.length
+        ? `Termine der nächsten 24 Stunden:\n${events.map(formatCalendarEvent).join("\n")}`
+        : "Keine Termine in den nächsten 24 Stunden gefunden.",
+    );
+    return;
+  }
+
+  if (action === "next") {
+    const events = await listCalendarEvents(chatId, 5, 24 * 14);
+    await sendTelegramMessage(
+      chatId,
+      events.length
+        ? `Nächste Termine:\n${events.map(formatCalendarEvent).join("\n")}`
+        : "Keine anstehenden Termine gefunden.",
+    );
+    return;
+  }
+
+  if (action === "create_help") {
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Termin erstellen:",
+        "/calendar_create YYYY-MM-DD HH:mm DauerMin Titel",
+        "",
+        "Beispiel:",
+        "/calendar_create 2026-05-03 15:00 60 Zahnarzt",
+      ].join("\n"),
+    );
+  }
+}
+
+async function sendTelegramMessage(chatId, text, extra = {}) {
   if (!TELEGRAM_BOT_TOKEN) {
     throw new Error("TELEGRAM_BOT_TOKEN is not set");
   }
@@ -751,6 +844,7 @@ async function sendTelegramMessage(chatId, text) {
       body: JSON.stringify({
         chat_id: chatId,
         text: chunk,
+        ...extra,
       }),
     });
 
@@ -812,6 +906,11 @@ async function handleTelegramCommand({ chatId, text }) {
 
   if (command === "/start" || command === "/help") {
     await sendTelegramMessage(chatId, formatHelpMessage());
+    return true;
+  }
+
+  if (command === "/gc") {
+    await sendGoogleCalendarMenu(chatId);
     return true;
   }
 
@@ -970,6 +1069,27 @@ async function handleTelegramMessage({ chatId, text, updateId }) {
   }
 }
 
+async function handleTelegramCallback(callbackQuery) {
+  const callbackId = callbackQuery?.id;
+  const chatId = callbackQuery?.message?.chat?.id;
+  const data = callbackQuery?.data || "";
+
+  try {
+    await answerTelegramCallback(callbackId);
+  } catch (err) {
+    console.warn(`[telegram] failed to answer callback: ${String(err)}`);
+  }
+
+  if (!chatId || !data.startsWith("gc:")) return;
+
+  try {
+    await handleGoogleCalendarAction(chatId, data.slice(3));
+  } catch (err) {
+    console.error(`[telegram] failed to handle callback: ${String(err)}`);
+    await sendTelegramMessage(chatId, `Google Kalender Aktion fehlgeschlagen: ${String(err)}`);
+  }
+}
+
 app.post("/telegram/webhook", (req, res) => {
   if (
     TELEGRAM_WEBHOOK_SECRET &&
@@ -980,21 +1100,26 @@ app.post("/telegram/webhook", (req, res) => {
   }
 
   const update = req.body ?? {};
+  const callbackQuery = update.callback_query;
   const message = update.message ?? update.edited_message ?? update.channel_post;
   const chat = message?.chat;
   const text = typeof message?.text === "string" ? message.text : "";
 
   console.log(
-    `[telegram] incoming update id=${update.update_id ?? "(unknown)"} chat=${chat?.id ?? "(unknown)"} type=${chat?.type ?? "unknown"} text=${text ? JSON.stringify(text.slice(0, 120)) : "(non-text)"}`,
+    `[telegram] incoming update id=${update.update_id ?? "(unknown)"} chat=${chat?.id ?? callbackQuery?.message?.chat?.id ?? "(unknown)"} type=${chat?.type ?? callbackQuery?.message?.chat?.type ?? "unknown"} text=${text ? JSON.stringify(text.slice(0, 120)) : callbackQuery ? `(callback ${callbackQuery.data})` : "(non-text)"}`,
   );
 
   res.sendStatus(200);
 
-  void handleTelegramMessage({
-    chatId: chat?.id,
-    text,
-    updateId: update.update_id,
-  });
+  if (callbackQuery) {
+    void handleTelegramCallback(callbackQuery);
+  } else {
+    void handleTelegramMessage({
+      chatId: chat?.id,
+      text,
+      updateId: update.update_id,
+    });
+  }
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
