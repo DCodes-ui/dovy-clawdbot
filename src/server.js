@@ -57,6 +57,15 @@ const GROQ_MODELS = Array.from(
       .filter(Boolean),
   ),
 );
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim();
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET?.trim();
+const GOOGLE_REDIRECT_URI =
+  process.env.GOOGLE_REDIRECT_URI?.trim() ||
+  "https://dovy-clawdbot-production.up.railway.app/google/oauth/callback";
+const GOOGLE_CALENDAR_SCOPES =
+  process.env.GOOGLE_CALENDAR_SCOPES?.trim() ||
+  "https://www.googleapis.com/auth/calendar";
+const GOOGLE_CALENDAR_TIME_ZONE = process.env.GOOGLE_CALENDAR_TIME_ZONE?.trim() || "Europe/Berlin";
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -84,6 +93,10 @@ function resolveGatewayToken() {
 
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
+const GOOGLE_OAUTH_STATE_SECRET =
+  process.env.GOOGLE_OAUTH_STATE_SECRET?.trim() ||
+  TELEGRAM_WEBHOOK_SECRET ||
+  OPENCLAW_GATEWAY_TOKEN;
 
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
@@ -373,6 +386,37 @@ app.get("/telegram/webhook", (_req, res) => {
   res.json({ ok: true, webhook: "telegram" });
 });
 
+app.get("/google/oauth/callback", async (req, res) => {
+  const state = readGoogleOAuthState(req.query.state);
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+
+  if (!state?.chatId || !code) {
+    return res.status(400).type("text/plain").send("Ungültiger Google OAuth Callback.\n");
+  }
+
+  try {
+    const tokens = await exchangeGoogleCode(code);
+    saveGoogleTokens(state.chatId, tokens);
+
+    try {
+      await sendTelegramMessage(state.chatId, "Google Kalender ist verbunden. Du kannst jetzt /calendar_today, /calendar_next oder /calendar_create nutzen.");
+    } catch (err) {
+      console.warn(`[google] failed to notify Telegram chat: ${String(err)}`);
+    }
+
+    return res.type("html").send(`<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; margin: 2rem;">
+  <h1>Google Kalender verbunden</h1>
+  <p>Du kannst dieses Fenster schließen und zum Telegram-Bot zurückkehren.</p>
+</body>
+</html>`);
+  } catch (err) {
+    console.error(`[google] oauth callback failed: ${String(err)}`);
+    return res.status(500).type("text/plain").send("Google Kalender konnte nicht verbunden werden. Bitte prüfe die Railway Logs.\n");
+  }
+});
+
 function appendWorkspaceJsonl(filename, record) {
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
   fs.appendFileSync(
@@ -404,6 +448,231 @@ function readChatModels() {
 function writeChatModels(models) {
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
   fs.writeFileSync(path.join(WORKSPACE_DIR, "telegram-chat-models.json"), JSON.stringify(models, null, 2));
+}
+
+function googleTokensDir() {
+  return path.join(WORKSPACE_DIR, "google-tokens");
+}
+
+function googleTokenPath(chatId) {
+  return path.join(googleTokensDir(), `${String(chatId).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+
+function createGoogleOAuthState(chatId) {
+  const payload = Buffer.from(JSON.stringify({ chatId, nonce: crypto.randomBytes(8).toString("hex") })).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", GOOGLE_OAUTH_STATE_SECRET)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function readGoogleOAuthState(state) {
+  const [payload, sig] = String(state || "").split(".");
+  if (!payload || !sig) return null;
+
+  const expected = crypto
+    .createHmac("sha256", GOOGLE_OAUTH_STATE_SECRET)
+    .update(payload)
+    .digest("base64url");
+  if (Buffer.byteLength(sig) !== Buffer.byteLength(expected)) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function googleConnectUrl(chatId) {
+  if (!GOOGLE_CLIENT_ID) return null;
+
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: GOOGLE_CALENDAR_SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    state: createGoogleOAuthState(chatId),
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function saveGoogleTokens(chatId, tokens) {
+  fs.mkdirSync(googleTokensDir(), { recursive: true });
+  fs.writeFileSync(googleTokenPath(chatId), JSON.stringify(tokens, null, 2), { mode: 0o600 });
+}
+
+function loadGoogleTokens(chatId) {
+  try {
+    return JSON.parse(fs.readFileSync(googleTokenPath(chatId), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function exchangeGoogleCode(code) {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    throw new Error("Google OAuth is not configured");
+  }
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: GOOGLE_REDIRECT_URI,
+      grant_type: "authorization_code",
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Google token exchange failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+
+  return {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    scope: data.scope,
+    tokenType: data.token_type,
+    expiresAt: Date.now() + Math.max(0, Number(data.expires_in || 0) - 60) * 1000,
+  };
+}
+
+async function refreshGoogleTokens(chatId, tokens) {
+  if (!tokens?.refreshToken) {
+    throw new Error("Google refresh token is missing. Please reconnect Google Calendar.");
+  }
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      refresh_token: tokens.refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Google token refresh failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+
+  const refreshed = {
+    ...tokens,
+    accessToken: data.access_token,
+    scope: data.scope || tokens.scope,
+    tokenType: data.token_type || tokens.tokenType,
+    expiresAt: Date.now() + Math.max(0, Number(data.expires_in || 0) - 60) * 1000,
+  };
+  saveGoogleTokens(chatId, refreshed);
+  return refreshed;
+}
+
+async function getGoogleAccessToken(chatId) {
+  const tokens = loadGoogleTokens(chatId);
+  if (!tokens?.accessToken) {
+    throw new Error("Google Calendar ist noch nicht verbunden. Nutze /connect_google.");
+  }
+  if (tokens.expiresAt && Date.now() < tokens.expiresAt) return tokens.accessToken;
+  return (await refreshGoogleTokens(chatId, tokens)).accessToken;
+}
+
+async function googleCalendarRequest(chatId, calendarPath, options = {}) {
+  const accessToken = await getGoogleAccessToken(chatId);
+  const response = await fetch(`https://www.googleapis.com/calendar/v3${calendarPath}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      ...(options.headers || {}),
+    },
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Google Calendar request failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+function formatCalendarEvent(event) {
+  const start = event.start?.dateTime || event.start?.date || "";
+  const when = start ? new Date(start).toLocaleString("de-DE", { timeZone: GOOGLE_CALENDAR_TIME_ZONE }) : "ohne Zeit";
+  return `${when} - ${event.summary || "(ohne Titel)"}`;
+}
+
+async function listCalendarEvents(chatId, maxResults = 5, hoursAhead = 24 * 14) {
+  const now = new Date();
+  const until = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
+  const params = new URLSearchParams({
+    timeMin: now.toISOString(),
+    timeMax: until.toISOString(),
+    singleEvents: "true",
+    orderBy: "startTime",
+    maxResults: String(maxResults),
+    timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+  });
+
+  const data = await googleCalendarRequest(chatId, `/calendars/primary/events?${params.toString()}`);
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+function addMinutesToLocalDateTime(date, time, minutesToAdd) {
+  const [year, month, day] = date.split("-").map(Number);
+  const [hour, minute] = time.split(":").map(Number);
+  const utc = new Date(Date.UTC(year, month - 1, day, hour, minute + minutesToAdd, 0));
+  const pad = (value) => String(value).padStart(2, "0");
+  return {
+    date: `${utc.getUTCFullYear()}-${pad(utc.getUTCMonth() + 1)}-${pad(utc.getUTCDate())}`,
+    time: `${pad(utc.getUTCHours())}:${pad(utc.getUTCMinutes())}`,
+  };
+}
+
+async function createCalendarEventFromCommand(chatId, arg) {
+  const match = arg.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?:\s+(\d+))?\s+(.+)$/);
+  if (!match) {
+    return {
+      ok: false,
+      message: [
+        "Format:",
+        "/calendar_create YYYY-MM-DD HH:mm DauerMin Titel",
+        "",
+        "Beispiel:",
+        "/calendar_create 2026-05-03 15:00 60 Zahnarzt",
+      ].join("\n"),
+    };
+  }
+
+  const [, date, time, durationRaw, summary] = match;
+  const durationMinutes = Number.parseInt(durationRaw || "60", 10);
+  const end = addMinutesToLocalDateTime(date, time, durationMinutes);
+  const event = await googleCalendarRequest(chatId, "/calendars/primary/events", {
+    method: "POST",
+    body: JSON.stringify({
+      summary,
+      start: {
+        dateTime: `${date}T${time}:00`,
+        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+      },
+      end: {
+        dateTime: `${end.date}T${end.time}:00`,
+        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+      },
+    }),
+  });
+
+  return {
+    ok: true,
+    message: `Termin erstellt:\n${formatCalendarEvent(event)}`,
+  };
 }
 
 function getChatModel(chatId) {
@@ -452,6 +721,11 @@ function formatHelpMessage() {
     "/model - aktuelles Modell anzeigen",
     "/model list - verfügbare Modelle anzeigen",
     "/model <modell> - Modell für diesen Chat setzen",
+    "/connect_google - Google Kalender verbinden",
+    "/disconnect_google - Google Kalender trennen",
+    "/calendar_next - nächste Termine anzeigen",
+    "/calendar_today - Termine der nächsten 24 Stunden anzeigen",
+    "/calendar_create YYYY-MM-DD HH:mm DauerMin Titel - Termin erstellen",
     "",
     "Sende sonst einfach eine Aufgabe als normale Nachricht.",
   ].join("\n");
@@ -586,6 +860,71 @@ async function handleTelegramCommand({ chatId, text }) {
 
     setChatModel(chatId, selected);
     await sendTelegramMessage(chatId, `Modell gesetzt auf:\n${selected}`);
+    return true;
+  }
+
+  if (command === "/connect_google") {
+    const url = googleConnectUrl(chatId);
+    if (!url) {
+      await sendTelegramMessage(
+        chatId,
+        "Google OAuth ist noch nicht konfiguriert. Bitte setze GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET und GOOGLE_REDIRECT_URI in Railway.",
+      );
+      return true;
+    }
+
+    await sendTelegramMessage(chatId, `Google Kalender verbinden:\n${url}`);
+    return true;
+  }
+
+  if (command === "/disconnect_google") {
+    try {
+      fs.rmSync(googleTokenPath(chatId), { force: true });
+      await sendTelegramMessage(chatId, "Google Kalender wurde getrennt.");
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Google Kalender konnte nicht getrennt werden: ${String(err)}`);
+    }
+    return true;
+  }
+
+  if (command === "/calendar_next") {
+    try {
+      const maxResults = Math.min(Math.max(Number.parseInt(arg || "5", 10) || 5, 1), 10);
+      const events = await listCalendarEvents(chatId, maxResults, 24 * 14);
+      await sendTelegramMessage(
+        chatId,
+        events.length
+          ? `Nächste Termine:\n${events.map(formatCalendarEvent).join("\n")}`
+          : "Keine anstehenden Termine gefunden.",
+      );
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Kalender konnte nicht gelesen werden: ${String(err)}`);
+    }
+    return true;
+  }
+
+  if (command === "/calendar_today") {
+    try {
+      const events = await listCalendarEvents(chatId, 10, 24);
+      await sendTelegramMessage(
+        chatId,
+        events.length
+          ? `Termine der nächsten 24 Stunden:\n${events.map(formatCalendarEvent).join("\n")}`
+          : "Keine Termine in den nächsten 24 Stunden gefunden.",
+      );
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Kalender konnte nicht gelesen werden: ${String(err)}`);
+    }
+    return true;
+  }
+
+  if (command === "/calendar_create") {
+    try {
+      const result = await createCalendarEventFromCommand(chatId, arg);
+      await sendTelegramMessage(chatId, result.message);
+    } catch (err) {
+      await sendTelegramMessage(chatId, `Termin konnte nicht erstellt werden: ${String(err)}`);
+    }
     return true;
   }
 
