@@ -49,6 +49,14 @@ const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
 const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
 const GROQ_MODEL = process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
+const GROQ_MODELS = Array.from(
+  new Set(
+    (process.env.GROQ_MODELS?.trim() || GROQ_MODEL)
+      .split(",")
+      .map((model) => model.trim())
+      .filter(Boolean),
+  ),
+);
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -365,6 +373,90 @@ app.get("/telegram/webhook", (_req, res) => {
   res.json({ ok: true, webhook: "telegram" });
 });
 
+function appendWorkspaceJsonl(filename, record) {
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  fs.appendFileSync(
+    path.join(WORKSPACE_DIR, filename),
+    `${JSON.stringify({ ...record, at: new Date().toISOString() })}\n`,
+  );
+}
+
+function readWorkspaceJsonl(filename) {
+  try {
+    const raw = fs.readFileSync(path.join(WORKSPACE_DIR, filename), "utf8");
+    return raw
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function readChatModels() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(WORKSPACE_DIR, "telegram-chat-models.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeChatModels(models) {
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  fs.writeFileSync(path.join(WORKSPACE_DIR, "telegram-chat-models.json"), JSON.stringify(models, null, 2));
+}
+
+function getChatModel(chatId) {
+  const models = readChatModels();
+  return models[String(chatId)] || GROQ_MODEL;
+}
+
+function setChatModel(chatId, model) {
+  const models = readChatModels();
+  models[String(chatId)] = model;
+  writeChatModels(models);
+}
+
+function saveTaskEvent(event) {
+  try {
+    appendWorkspaceJsonl("telegram-tasks.jsonl", event);
+  } catch (err) {
+    console.warn(`[telegram] failed to save task: ${String(err)}`);
+  }
+}
+
+function loadTasksForChat(chatId) {
+  const latestByTask = new Map();
+  for (const event of readWorkspaceJsonl("telegram-tasks.jsonl")) {
+    if (String(event.chatId) !== String(chatId) || !event.taskId) continue;
+    latestByTask.set(event.taskId, { ...latestByTask.get(event.taskId), ...event });
+  }
+
+  return Array.from(latestByTask.values()).sort((a, b) =>
+    String(b.updatedAt || b.at || "").localeCompare(String(a.updatedAt || a.at || "")),
+  );
+}
+
+function formatTaskLine(task) {
+  const status = task.status || "unknown";
+  const text = String(task.userText || "").replace(/\s+/g, " ").slice(0, 80);
+  return `${task.taskId.slice(0, 8)} | ${status} | ${text || "(ohne Text)"}`;
+}
+
+function formatHelpMessage() {
+  return [
+    "Verfügbare Befehle:",
+    "/help - Hilfe anzeigen",
+    "/tasks - letzte Aufgaben anzeigen",
+    "/last - letztes Ergebnis anzeigen",
+    "/model - aktuelles Modell anzeigen",
+    "/model list - verfügbare Modelle anzeigen",
+    "/model <modell> - Modell für diesen Chat setzen",
+    "",
+    "Sende sonst einfach eine Aufgabe als normale Nachricht.",
+  ].join("\n");
+}
+
 async function sendTelegramMessage(chatId, text) {
   if (!TELEGRAM_BOT_TOKEN) {
     throw new Error("TELEGRAM_BOT_TOKEN is not set");
@@ -397,7 +489,7 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
-async function callGroq(prompt) {
+async function callGroq(prompt, model = GROQ_MODEL) {
   if (!GROQ_API_KEY) {
     return "Groq ist noch nicht konfiguriert. Bitte setze GROQ_API_KEY in Railway und redeploye den Service.";
   }
@@ -409,7 +501,7 @@ async function callGroq(prompt) {
       Authorization: `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model,
       messages: [
         {
           role: "system",
@@ -433,14 +525,71 @@ async function callGroq(prompt) {
 
 function saveTelegramConversation(record) {
   try {
-    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
-    fs.appendFileSync(
-      path.join(WORKSPACE_DIR, "telegram-conversations.jsonl"),
-      `${JSON.stringify({ ...record, at: new Date().toISOString() })}\n`,
-    );
+    appendWorkspaceJsonl("telegram-conversations.jsonl", record);
   } catch (err) {
     console.warn(`[telegram] failed to save conversation: ${String(err)}`);
   }
+}
+
+async function handleTelegramCommand({ chatId, text }) {
+  const [rawCommand, ...args] = text.trim().split(/\s+/);
+  const command = rawCommand.split("@")[0].toLowerCase();
+  const arg = args.join(" ").trim();
+
+  if (command === "/start" || command === "/help") {
+    await sendTelegramMessage(chatId, formatHelpMessage());
+    return true;
+  }
+
+  if (command === "/tasks") {
+    const tasks = loadTasksForChat(chatId).slice(0, 10);
+    await sendTelegramMessage(
+      chatId,
+      tasks.length
+        ? `Letzte Aufgaben:\n${tasks.map(formatTaskLine).join("\n")}`
+        : "Noch keine Aufgaben gespeichert.",
+    );
+    return true;
+  }
+
+  if (command === "/last") {
+    const last = loadTasksForChat(chatId)[0];
+    if (!last) {
+      await sendTelegramMessage(chatId, "Noch keine Aufgaben gespeichert.");
+      return true;
+    }
+
+    const answer = last.assistantText ? `\n\nAntwort:\n${last.assistantText}` : "";
+    await sendTelegramMessage(chatId, `${formatTaskLine(last)}${answer}`);
+    return true;
+  }
+
+  if (command === "/model") {
+    if (!arg) {
+      await sendTelegramMessage(chatId, `Aktuelles Modell:\n${getChatModel(chatId)}`);
+      return true;
+    }
+
+    if (arg.toLowerCase() === "list") {
+      await sendTelegramMessage(
+        chatId,
+        `Verfügbare Modelle:\n${GROQ_MODELS.map((model, index) => `${index + 1}. ${model}`).join("\n")}`,
+      );
+      return true;
+    }
+
+    const selected = /^\d+$/.test(arg) ? GROQ_MODELS[Number.parseInt(arg, 10) - 1] : arg;
+    if (!selected) {
+      await sendTelegramMessage(chatId, "Dieses Modell kenne ich nicht. Nutze /model list.");
+      return true;
+    }
+
+    setChatModel(chatId, selected);
+    await sendTelegramMessage(chatId, `Modell gesetzt auf:\n${selected}`);
+    return true;
+  }
+
+  return false;
 }
 
 async function handleTelegramMessage({ chatId, text, updateId }) {
@@ -455,13 +604,25 @@ async function handleTelegramMessage({ chatId, text, updateId }) {
     return;
   }
 
+  if (text.trim().startsWith("/") && await handleTelegramCommand({ chatId, text })) {
+    return;
+  }
+
+  const taskId = `${Date.now().toString(36)}-${updateId ?? crypto.randomBytes(3).toString("hex")}`;
+  const model = getChatModel(chatId);
+  const startedAt = new Date().toISOString();
+  saveTaskEvent({ taskId, updateId, chatId, status: "running", userText: text, model, createdAt: startedAt, updatedAt: startedAt });
+
   try {
     await sendTelegramMessage(chatId, "Ich bearbeite deine Anfrage...");
-    const answer = await callGroq(text);
-    saveTelegramConversation({ updateId, chatId, userText: text, assistantText: answer, model: GROQ_MODEL });
+    const answer = await callGroq(text, model);
+    const finishedAt = new Date().toISOString();
+    saveTaskEvent({ taskId, updateId, chatId, status: "done", userText: text, assistantText: answer, model, createdAt: startedAt, updatedAt: finishedAt });
+    saveTelegramConversation({ updateId, chatId, taskId, userText: text, assistantText: answer, model });
     await sendTelegramMessage(chatId, answer);
   } catch (err) {
     console.error(`[telegram] failed to handle message: ${String(err)}`);
+    saveTaskEvent({ taskId, updateId, chatId, status: "failed", userText: text, error: String(err), model, createdAt: startedAt, updatedAt: new Date().toISOString() });
     try {
       await sendTelegramMessage(chatId, "Beim Bearbeiten ist ein Fehler aufgetreten. Bitte prüfe die Railway Logs.");
     } catch (sendErr) {
