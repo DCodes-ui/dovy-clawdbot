@@ -636,6 +636,28 @@ function addMinutesToLocalDateTime(date, time, minutesToAdd) {
   };
 }
 
+async function createCalendarEvent(chatId, { date, time, durationMinutes = 60, summary }) {
+  if (!date || !time || !summary) {
+    throw new Error("date, time and summary are required");
+  }
+
+  const end = addMinutesToLocalDateTime(date, time, durationMinutes);
+  return await googleCalendarRequest(chatId, "/calendars/primary/events", {
+    method: "POST",
+    body: JSON.stringify({
+      summary,
+      start: {
+        dateTime: `${date}T${time}:00`,
+        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+      },
+      end: {
+        dateTime: `${end.date}T${end.time}:00`,
+        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+      },
+    }),
+  });
+}
+
 async function createCalendarEventFromCommand(chatId, arg) {
   const match = arg.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?:\s+(\d+))?\s+(.+)$/);
   if (!match) {
@@ -653,21 +675,7 @@ async function createCalendarEventFromCommand(chatId, arg) {
 
   const [, date, time, durationRaw, summary] = match;
   const durationMinutes = Number.parseInt(durationRaw || "60", 10);
-  const end = addMinutesToLocalDateTime(date, time, durationMinutes);
-  const event = await googleCalendarRequest(chatId, "/calendars/primary/events", {
-    method: "POST",
-    body: JSON.stringify({
-      summary,
-      start: {
-        dateTime: `${date}T${time}:00`,
-        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
-      },
-      end: {
-        dateTime: `${end.date}T${end.time}:00`,
-        timeZone: GOOGLE_CALENDAR_TIME_ZONE,
-      },
-    }),
-  });
+  const event = await createCalendarEvent(chatId, { date, time, durationMinutes, summary });
 
   return {
     ok: true,
@@ -891,6 +899,108 @@ async function callGroq(prompt, model = GROQ_MODEL) {
   return data?.choices?.[0]?.message?.content?.trim() || "Ich habe keine Antwort von Groq erhalten.";
 }
 
+function getZonedNowParts() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "long",
+    hour12: false,
+  }).formatToParts(new Date());
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  return {
+    date: `${value("year")}-${value("month")}-${value("day")}`,
+    time: `${value("hour")}:${value("minute")}`,
+    weekday: value("weekday"),
+    timeZone: GOOGLE_CALENDAR_TIME_ZONE,
+  };
+}
+
+function extractJsonObject(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = String(text || "").match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function detectCalendarIntent(text) {
+  if (!GROQ_API_KEY) return { action: "none" };
+
+  const now = getZonedNowParts();
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "Du bist ein Parser fuer Google-Kalender-Wuensche.",
+            "Antworte ausschliesslich als JSON-Objekt ohne Markdown.",
+            "Erlaubte actions: create_calendar_event, list_calendar_events, none.",
+            "Nutze action none, wenn Datum oder Uhrzeit fuer einen neuen Termin unklar sind.",
+            "Fuer create_calendar_event nutze Felder: action, summary, date, time, durationMinutes.",
+            "date muss YYYY-MM-DD sein, time muss HH:mm sein, durationMinutes default 60.",
+            "Fuer list_calendar_events nutze Felder: action, rangeHours, maxResults.",
+            `Heute ist ${now.weekday}, ${now.date}, ${now.time} (${now.timeZone}).`,
+          ].join("\n"),
+        },
+        { role: "user", content: text },
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" },
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Groq calendar intent failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  return extractJsonObject(data?.choices?.[0]?.message?.content) || { action: "none" };
+}
+
+async function handleNaturalCalendarIntent(chatId, text) {
+  const intent = await detectCalendarIntent(text);
+
+  if (intent?.action === "create_calendar_event") {
+    const durationMinutes = Math.min(Math.max(Number.parseInt(String(intent.durationMinutes || "60"), 10) || 60, 1), 24 * 60);
+    const event = await createCalendarEvent(chatId, {
+      date: intent.date,
+      time: intent.time,
+      durationMinutes,
+      summary: intent.summary,
+    });
+    return `Termin erstellt:\n${formatCalendarEvent(event)}`;
+  }
+
+  if (intent?.action === "list_calendar_events") {
+    const rangeHours = Math.min(Math.max(Number.parseInt(String(intent.rangeHours || "336"), 10) || 336, 1), 24 * 60);
+    const maxResults = Math.min(Math.max(Number.parseInt(String(intent.maxResults || "5"), 10) || 5, 1), 10);
+    const events = await listCalendarEvents(chatId, maxResults, rangeHours);
+    return events.length
+      ? `Gefundene Termine:\n${events.map(formatCalendarEvent).join("\n")}`
+      : "Keine passenden Termine gefunden.";
+  }
+
+  return null;
+}
+
 function saveTelegramConversation(record) {
   try {
     appendWorkspaceJsonl("telegram-conversations.jsonl", record);
@@ -1053,7 +1163,8 @@ async function handleTelegramMessage({ chatId, text, updateId }) {
 
   try {
     await sendTelegramMessage(chatId, "Ich bearbeite deine Anfrage...");
-    const answer = await callGroq(text, model);
+    const calendarAnswer = await handleNaturalCalendarIntent(chatId, text);
+    const answer = calendarAnswer || await callGroq(text, model);
     const finishedAt = new Date().toISOString();
     saveTaskEvent({ taskId, updateId, chatId, status: "done", userText: text, assistantText: answer, model, createdAt: startedAt, updatedAt: finishedAt });
     saveTelegramConversation({ updateId, chatId, taskId, userText: text, assistantText: answer, model });
@@ -1062,7 +1173,10 @@ async function handleTelegramMessage({ chatId, text, updateId }) {
     console.error(`[telegram] failed to handle message: ${String(err)}`);
     saveTaskEvent({ taskId, updateId, chatId, status: "failed", userText: text, error: String(err), model, createdAt: startedAt, updatedAt: new Date().toISOString() });
     try {
-      await sendTelegramMessage(chatId, "Beim Bearbeiten ist ein Fehler aufgetreten. Bitte prüfe die Railway Logs.");
+      const message = String(err).includes("Google Calendar ist noch nicht verbunden")
+        ? "Google Kalender ist noch nicht verbunden. Nutze /connect_google oder /gc."
+        : "Beim Bearbeiten ist ein Fehler aufgetreten. Bitte prüfe die Railway Logs.";
+      await sendTelegramMessage(chatId, message);
     } catch (sendErr) {
       console.error(`[telegram] failed to send error message: ${String(sendErr)}`);
     }
