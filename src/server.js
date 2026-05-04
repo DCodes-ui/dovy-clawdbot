@@ -57,6 +57,8 @@ const GROQ_MODELS = Array.from(
       .filter(Boolean),
   ),
 );
+const TELEGRAM_CONTEXT_TURNS = Math.min(Math.max(Number.parseInt(process.env.TELEGRAM_CONTEXT_TURNS ?? "8", 10) || 8, 0), 30);
+const TELEGRAM_CONTEXT_MAX_CHARS = Math.min(Math.max(Number.parseInt(process.env.TELEGRAM_CONTEXT_MAX_CHARS ?? "12000", 10) || 12000, 1000), 50000);
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim();
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET?.trim();
 const GOOGLE_REDIRECT_URI =
@@ -396,7 +398,21 @@ app.get("/google/oauth/callback", async (req, res) => {
 
   try {
     const tokens = await exchangeGoogleCode(code);
-    saveGoogleTokens(state.chatId, tokens);
+    const savedTokens = saveGoogleTokens(state.chatId, tokens);
+    if (!savedTokens.refreshToken) {
+      fs.rmSync(googleTokenPath(state.chatId), { force: true });
+      await sendTelegramMessage(
+        state.chatId,
+        "Google hat keinen dauerhaften Kalender-Zugriff geliefert. Bitte nutze /connect_google noch einmal. Wenn das erneut passiert, entferne den Bot zuerst in deinem Google-Konto unter Drittanbieter-Zugriff und verbinde ihn danach neu.",
+      );
+      return res.status(400).type("html").send(`<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; margin: 2rem;">
+  <h1>Google Kalender nicht dauerhaft verbunden</h1>
+  <p>Google hat keinen dauerhaften Zugriffstoken geliefert. Bitte verbinde den Kalender im Telegram-Bot erneut.</p>
+</body>
+</html>`);
+    }
 
     try {
       await sendTelegramMessage(state.chatId, "Google Kalender ist verbunden. Du kannst jetzt /calendar_today, /calendar_next oder /calendar_create nutzen.");
@@ -501,8 +517,16 @@ function googleConnectUrl(chatId) {
 }
 
 function saveGoogleTokens(chatId, tokens) {
+  const existingTokens = loadGoogleTokens(chatId);
+  const mergedTokens = {
+    ...(existingTokens || {}),
+    ...(tokens || {}),
+    refreshToken: tokens?.refreshToken || existingTokens?.refreshToken,
+  };
+
   fs.mkdirSync(googleTokensDir(), { recursive: true });
-  fs.writeFileSync(googleTokenPath(chatId), JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  fs.writeFileSync(googleTokenPath(chatId), JSON.stringify(mergedTokens, null, 2), { mode: 0o600 });
+  return mergedTokens;
 }
 
 function loadGoogleTokens(chatId) {
@@ -546,7 +570,10 @@ async function exchangeGoogleCode(code) {
 
 async function refreshGoogleTokens(chatId, tokens) {
   if (!tokens?.refreshToken) {
-    throw new Error("Google refresh token is missing. Please reconnect Google Calendar.");
+    throw new Error("Google Kalender ist nur temporär verbunden. Bitte nutze /connect_google, damit der Bot dauerhaften Zugriff erhält.");
+  }
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    throw new Error("Google OAuth is not configured");
   }
 
   const response = await fetch("https://oauth2.googleapis.com/token", {
@@ -562,12 +589,16 @@ async function refreshGoogleTokens(chatId, tokens) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (data?.error === "invalid_grant") {
+      throw new Error("Google Kalender Verbindung wurde von Google widerrufen oder ist abgelaufen. Bitte verbinde Google Kalender einmal neu mit /connect_google.");
+    }
     throw new Error(`Google token refresh failed: ${response.status} ${JSON.stringify(data)}`);
   }
 
   const refreshed = {
     ...tokens,
     accessToken: data.access_token,
+    refreshToken: data.refresh_token || tokens.refreshToken,
     scope: data.scope || tokens.scope,
     tokenType: data.token_type || tokens.tokenType,
     expiresAt: Date.now() + Math.max(0, Number(data.expires_in || 0) - 60) * 1000,
@@ -578,16 +609,18 @@ async function refreshGoogleTokens(chatId, tokens) {
 
 async function getGoogleAccessToken(chatId) {
   const tokens = loadGoogleTokens(chatId);
-  if (!tokens?.accessToken) {
+  if (!tokens) {
     throw new Error("Google Calendar ist noch nicht verbunden. Nutze /connect_google.");
   }
-  if (tokens.expiresAt && Date.now() < tokens.expiresAt) return tokens.accessToken;
+  if (!tokens.refreshToken) {
+    throw new Error("Google Kalender ist nur temporär verbunden. Bitte nutze /connect_google, damit der Bot dauerhaften Zugriff erhält.");
+  }
+  if (tokens.accessToken && tokens.expiresAt && Date.now() < tokens.expiresAt) return tokens.accessToken;
   return (await refreshGoogleTokens(chatId, tokens)).accessToken;
 }
 
-async function googleCalendarRequest(chatId, calendarPath, options = {}) {
-  const accessToken = await getGoogleAccessToken(chatId);
-  const response = await fetch(`https://www.googleapis.com/calendar/v3${calendarPath}`, {
+async function fetchGoogleCalendar(accessToken, calendarPath, options = {}) {
+  return await fetch(`https://www.googleapis.com/calendar/v3${calendarPath}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -595,8 +628,22 @@ async function googleCalendarRequest(chatId, calendarPath, options = {}) {
       ...(options.headers || {}),
     },
   });
+}
 
-  const data = await response.json().catch(() => ({}));
+async function googleCalendarRequest(chatId, calendarPath, options = {}) {
+  const accessToken = await getGoogleAccessToken(chatId);
+  let response = await fetchGoogleCalendar(accessToken, calendarPath, options);
+  let data = await response.json().catch(() => ({}));
+
+  if (response.status === 401) {
+    const tokens = loadGoogleTokens(chatId);
+    if (tokens?.refreshToken) {
+      const refreshed = await refreshGoogleTokens(chatId, tokens);
+      response = await fetchGoogleCalendar(refreshed.accessToken, calendarPath, options);
+      data = await response.json().catch(() => ({}));
+    }
+  }
+
   if (!response.ok) {
     throw new Error(`Google Calendar request failed: ${response.status} ${JSON.stringify(data)}`);
   }
@@ -865,7 +912,57 @@ async function sendTelegramMessage(chatId, text, extra = {}) {
   }
 }
 
-async function callGroq(prompt, model = GROQ_MODEL) {
+function compactConversationText(value, maxChars = 2000) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars)}...` : text;
+}
+
+function loadTelegramConversationForChat(chatId, limit = TELEGRAM_CONTEXT_TURNS) {
+  if (limit <= 0) return [];
+
+  return readWorkspaceJsonl("telegram-conversations.jsonl")
+    .filter((record) =>
+      String(record.chatId) === String(chatId) &&
+      (record.userText || record.assistantText)
+    )
+    .sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")))
+    .slice(-limit);
+}
+
+function buildGroqMessages(prompt, history = []) {
+  const messages = [
+    {
+      role: "system",
+      content: [
+        "Du bist ein hilfreicher Aufgaben-Assistent. Antworte kurz, konkret und auf Deutsch, sofern der Nutzer nichts anderes verlangt.",
+        "Beruecksichtige den bisherigen Chatverlauf, damit Folgefragen, Pronomen und Verweise auf fruehere Nachrichten verstanden werden.",
+      ].join("\n"),
+    },
+  ];
+
+  const historyMessages = [];
+  for (const item of history) {
+    const userText = compactConversationText(item.userText);
+    const assistantText = compactConversationText(item.assistantText);
+    if (userText) historyMessages.push({ role: "user", content: userText });
+    if (assistantText) historyMessages.push({ role: "assistant", content: assistantText });
+  }
+
+  const selectedHistory = [];
+  let usedChars = 0;
+  for (let i = historyMessages.length - 1; i >= 0; i -= 1) {
+    const contentLength = historyMessages[i].content.length;
+    if (selectedHistory.length && usedChars + contentLength > TELEGRAM_CONTEXT_MAX_CHARS) break;
+    selectedHistory.unshift(historyMessages[i]);
+    usedChars += contentLength;
+  }
+
+  messages.push(...selectedHistory);
+  messages.push({ role: "user", content: prompt });
+  return messages;
+}
+
+async function callGroq(prompt, model = GROQ_MODEL, history = []) {
   if (!GROQ_API_KEY) {
     return "Groq ist noch nicht konfiguriert. Bitte setze GROQ_API_KEY in Railway und redeploye den Service.";
   }
@@ -878,14 +975,7 @@ async function callGroq(prompt, model = GROQ_MODEL) {
     },
     body: JSON.stringify({
       model,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Du bist ein hilfreicher Aufgaben-Assistent. Antworte kurz, konkret und auf Deutsch, sofern der Nutzer nichts anderes verlangt.",
-        },
-        { role: "user", content: prompt },
-      ],
+      messages: buildGroqMessages(prompt, history),
       temperature: 0.3,
     }),
   });
@@ -1163,8 +1253,9 @@ async function handleTelegramMessage({ chatId, text, updateId }) {
 
   try {
     await sendTelegramMessage(chatId, "Ich bearbeite deine Anfrage...");
+    const conversationHistory = loadTelegramConversationForChat(chatId);
     const calendarAnswer = await handleNaturalCalendarIntent(chatId, text);
-    const answer = calendarAnswer || await callGroq(text, model);
+    const answer = calendarAnswer || await callGroq(text, model, conversationHistory);
     const finishedAt = new Date().toISOString();
     saveTaskEvent({ taskId, updateId, chatId, status: "done", userText: text, assistantText: answer, model, createdAt: startedAt, updatedAt: finishedAt });
     saveTelegramConversation({ updateId, chatId, taskId, userText: text, assistantText: answer, model });
